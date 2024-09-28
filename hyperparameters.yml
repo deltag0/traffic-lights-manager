@@ -1,0 +1,8 @@
+4_way:
+  lr: 0.001
+  discount_factor: 0.99
+  epsilon_decay: 0.9995
+  min_epsilon: 0.05
+  init_epsilon: 0.99
+  model_varsion: dqn_1
+  model: DQN # DQN or PPO
