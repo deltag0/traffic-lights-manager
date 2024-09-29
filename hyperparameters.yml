@@ -4,5 +4,8 @@
   epsilon_decay: 0.9995
   min_epsilon: 0.05
   init_epsilon: 0.99
-  model_varsion: dqn_1
-  model: DQN # DQN or PPO
+  model_version: dqn_1
+  batch_size: 64  # size of batch of replayed memories
+  max_len: 99999999  # max lenght of replay memories
+  sync_steps: 1000  # number of steps until weights of policy network are copied to the target network
+  model: DQN  # DQN or PPO
