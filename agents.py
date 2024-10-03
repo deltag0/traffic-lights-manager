@@ -229,10 +229,13 @@ class PPO_Agent():
 
         # initializing hyperparameters
         self.clip = hyperparameters["clip"]
-        self.batches = hyperparameters["batches"]
         self.discount_factor = hyperparameters["discount_factor"]
         self.model_version = hyperparameters["model_version"]
-        self.episode_time = hyperparameters["episode_time"]
+        self.max_steps = hyperparameters["max_steps"]
+        self.overload = hyperparameters["overload"]
+        self.batches = hyperparameters["batches"]
+        self.iteration_updates = hyperparameters["iteration_updates"]
+        self.lr = hyperparameters["lr"]
 
         # initialize path files
         self.log_file = os.path.join(DIR_PATH, "models", self.model, "logs", self.model_version + ".txt")
@@ -265,73 +268,122 @@ class PPO_Agent():
 
         # initialize the critic network
         if is_training:
+            self.batch_size = self.max_steps // self.batches
+
             critic = PPO(input_layers, 1, intersection.lanes, intersection.max_occupancy)
+            optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr)
 
             loss_history = []
+            steps = 0
 
-        # for loop for every batch round (i.e episodes = batch_size * i)
+        # main loop
         for i in count(0):
             state = env.reset()[0]
             state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
 
-            # initialize batch data which will be used to update the policy
+            # initialize data for collecting information from steps
             if is_training:
-                rewards_per_episode = []
-                state_batch = []
-                action_batch = []
-                prob_batch = []
-                batch_len = []
+                rewards_buffer = []
+                state_buffer = []
+                action_buffer = []
+                prob_buffer = []
+                step_buffer = []
+                steps = 0
 
-            # for loop for every batch
-            for batch in range(self.batches):
-                state = env.reset()[0]
+            terminated = False
+
+            # continuing task loop
+            while not terminated:
+                action, log_prob = self.get_action(state.unsqueeze(0))
+
+                new_state, reward, terminated, _, _ = env.step(action)
+
+                # track data
+                if is_training:
+                    rewards_buffer.append(reward)
+                    state_buffer.append(state)
+                    action_buffer.append(action)
+                    prob_buffer.append(log_prob)
+                    steps += 1
+
+                if self.lane_overload(new_state):
+                    break
+
+                state = new_state
                 state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
 
-                if is_training:
-                    batch_rewards = []
+                # trigger update
+                if steps == self.max_steps:
                     steps = 0
 
-                terminated = False
+                    # batchify data
+                    state_buffer = torch.stack(state_buffer)
+                    action_buffer = torch.tensor(action_buffer, dtype=torch.float32, device=DEVICE)
+                    prob_buffer = torch.tensor(prob_buffer, dtype=torch.float32, device=DEVICE)
 
-                episode_reward = 0.0
+                    # Advantage function
+                    V, _ = self.evaluate(state_buffer, critic, action_buffer)
 
-                # episode loop
-                end_time = time.time() + self.episode_time
-                while time.time() < end_time:
-                    action, log_prob = self.get_action(state.unsqueeze(0))
+                    # compute discounted rewards
+                    rewards_buffer = self.batchify(rewards_buffer)
+                    rewards_buffer = self.compute(rewards_buffer)
 
-                    new_state, reward, terminated, _, _ = env.step(action)
+                    advantage = rewards_buffer - V.detach()
 
-                    # collect data from batch to update policy
-                    if is_training:
-                        batch_rewards.append(reward)
-                        prob_batch.append(log_prob)
-                        state_batch.append(state)
-                        action_batch.append(action)
-                        steps += 1
-                    episode_reward += reward
+                    # normalize advantage
+                    advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-10)
 
-                    state = new_state
-                    state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
+                    # update policy
+                    for _ in range(self.iteration_updates):
+                        _, curr_log_prob = self.evaluate(state_buffer, critic, action_buffer)
 
-                if is_training:
-                    rewards_per_episode.append(batch_rewards)
-                    batch_len.append(steps)
+                        ratios = torch.exp(curr_log_prob - prob_buffer)
 
-            if is_training:
-                state_batch = torch.stack(state_batch, dim=0)
-                action_batch = torch.tensor(action_batch, dtype=torch.float32, device=DEVICE)
-                prob_batch = torch.tensor(prob_batch, dtype=torch.float32, device=DEVICE)
-                rewards_per_episode = self.compute(rewards_per_episode)
+                        surr1 = ratios * advantage
+                        surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * advantage
 
-            # Evaluate 
-            V = self.evaluate(state_batch, critic)
+                        policy_loss = (-torch.min(surr1, surr2)).mean()
+                        self.policy.zero_grad()
+                        policy_loss.backward()
+                        optimizer.step()
 
-    def evaluate(self, state_batch: torch.Tensor, critic: torch.nn.Module) -> torch.Tensor:
-        return critic(state_batch.unsqueeze(0)).squeeze()
 
-    # returns a list of shape (batches, episode_timesteps)
-    def compute(self, reward_batch: list[list[float]]) -> list[list[float]]:
+                    rewards_buffer = []
+                    state_buffer = []
+                    action_buffer = []
+                    prob_buffer = []
+                    step_buffer = []
+
+    def lane_overload(self, state: list[float]):
+        score = 0
+        for i in range(5, 12):
+            score += state[i]
+
+        if score >= self.overload:
+            return True
+        else:
+            return False
+
+    # turns buffers into batches with the size specified in the hyperparameters
+    def batchify(self, data: list[torch.Tensor]) -> torch.Tensor:
+        batch = []
+
+        for i in range(self.batches):
+            batch.append(data[i * self.batch_size:(i + 1) * self.batch_size])
+
+        return batch
+
+    # evaluates the states according to the critic network
+    def evaluate(self, state_batch: torch.Tensor, critic: torch.nn.Module, action_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+        logits = critic(state_batch).squeeze()
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(action_batch)
+
+        return logits, log_probs
+
+    # returns a list of shape (episode_timesteps)
+    def compute(self, reward_batch: list[list[torch.Tensor]]) -> list[torch.Tensor]:
         batch = []
 
         for ep_reward in reward_batch[::-1]:
@@ -341,6 +393,7 @@ class PPO_Agent():
             for reward in ep_reward[::-1]:
                 discounted_reward = reward + discounted_reward * self.discount_factor
                 batch.insert(0, discounted_reward)
+
         batch = torch.tensor(batch, dtype=torch.float, device=DEVICE)
 
         return batch
