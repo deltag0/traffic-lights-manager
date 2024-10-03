@@ -1,6 +1,7 @@
 import os
 import sys
 import random
+import time
 from datetime import datetime, timedelta
 
 
@@ -17,8 +18,8 @@ from itertools import count  # used for infinite loop
 
 
 from constants import DEVICE, DATE_FORMAT, DIR_PATH
-sys.path.insert(0, DIR_PATH + "\\models\\DQN")  # allow imports from DQN
-sys.path.insert(0, DIR_PATH + "\\models\\PPO")  # allow imports from PPO
+sys.path.insert(0, os.path.join(DIR_PATH, "models", "DQN"))  # allow imports from DQN
+sys.path.insert(0, os.path.join(DIR_PATH, "models", "PPO"))  # allow imports from PPO
 from dqn import DQN
 from ppo import PPO
 from experience import Saved_Memories
@@ -124,25 +125,25 @@ class DQN_Agent():
             terminated = False
             episode_reward = 0.0
 
-            state = torch.tensor(state, dtype=torch.float64, device=DEVICE)
+            state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
 
             # steps in episode
             while (not terminated):
                 if is_training and random.random() < epsilon:
                     action = env.action_space.sample()
-                    action = torch.tensor(action, dtype=torch.float64, device=DEVICE)
+                    action = torch.tensor(action, dtype=torch.float32, device=DEVICE)
                 else:
                     # don't need extra computation
                     with torch.no_grad:
                         action = policy(state.unsqueeze(0)).squeeze().argmax()
-                        action = torch.tensor(action, dtype=torch.float64, device=DEVICE)
+                        action = torch.tensor(action, dtype=torch.float32, device=DEVICE)
 
                 new_state, reward, terminated, _, _ = env.step(action.item())
 
                 episode_reward += reward
 
-                new_state = torch.tensor(new_state, dtype=torch.float64, device=DEVICE)
-                reward = torch.tensor(reward, dtype=torch.float64, device=DEVICE)
+                new_state = torch.tensor(new_state, dtype=torch.float32, device=DEVICE)
+                reward = torch.tensor(reward, dtype=torch.float32, device=DEVICE)
 
                 # adding observations to memory
                 if is_training:
@@ -231,11 +232,12 @@ class PPO_Agent():
         self.batches = hyperparameters["batches"]
         self.discount_factor = hyperparameters["discount_factor"]
         self.model_version = hyperparameters["model_version"]
+        self.episode_time = hyperparameters["episode_time"]
 
         # initialize path files
-        self.log_file = DIR_PATH + "\\models\\" + self.model + "\\logs\\" + self.model_version + ".txt"
-        self.graph_file = DIR_PATH + "\\models\\" + self.model + "\\graphs\\" + self.model_version + ".png"
-        self.model_file = DIR_PATH + "\\models\\" + self.model + "\\trained_models\\" + self.model_version + ".pth"
+        self.log_file = os.path.join(DIR_PATH, "models", self.model, "logs", self.model_version + ".txt")
+        self.graph_file = os.path.join(DIR_PATH, "models", self.model, "graphs", self.model_version + ".png")
+        self.model_file = os.path.join(DIR_PATH, "models", self.model, "trained_models", self.model_version + ".pth")
 
     def run(self, is_training: bool = True) -> None:
 
@@ -267,10 +269,10 @@ class PPO_Agent():
 
             loss_history = []
 
-        # for loop for every batch round, not episode (i.e episodes = batch_size * i)
+        # for loop for every batch round (i.e episodes = batch_size * i)
         for i in count(0):
             state = env.reset()[0]
-            state = torch.tensor(state, torch.float64, device=DEVICE)
+            state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
 
             # initialize batch data which will be used to update the policy
             if is_training:
@@ -281,9 +283,9 @@ class PPO_Agent():
                 batch_len = []
 
             # for loop for every batch
-            for batch in self.batch_timesteps:
+            for batch in range(self.batches):
                 state = env.reset()[0]
-                state = torch.tensor(state, torch.float64, device=DEVICE)
+                state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
 
                 if is_training:
                     batch_rewards = []
@@ -294,7 +296,8 @@ class PPO_Agent():
                 episode_reward = 0.0
 
                 # episode loop
-                while not terminated:
+                end_time = time.time() + self.episode_time
+                while time.time() < end_time:
                     action, log_prob = self.get_action(state.unsqueeze(0))
 
                     new_state, reward, terminated, _, _ = env.step(action)
@@ -309,19 +312,25 @@ class PPO_Agent():
                     episode_reward += reward
 
                     state = new_state
-                    state = torch.tensor(state, torch.float64, device=DEVICE)
+                    state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
 
                 if is_training:
                     rewards_per_episode.append(batch_rewards)
                     batch_len.append(steps)
 
             if is_training:
-                state_batch = torch.tensor(state_batch, torch.float64, device=DEVICE)
-                action_batch = torch.tensor(action_batch, torch.float64, device=DEVICE)
-                prob_batch = torch.tensor(prob_batch, torch.float64, device=DEVICE)
-
+                state_batch = torch.stack(state_batch, dim=0)
+                action_batch = torch.tensor(action_batch, dtype=torch.float32, device=DEVICE)
+                prob_batch = torch.tensor(prob_batch, dtype=torch.float32, device=DEVICE)
                 rewards_per_episode = self.compute(rewards_per_episode)
 
+            # Evaluate 
+            V = self.evaluate(state_batch, critic)
+
+    def evaluate(self, state_batch: torch.Tensor, critic: torch.nn.Module) -> torch.Tensor:
+        return critic(state_batch.unsqueeze(0)).squeeze()
+
+    # returns a list of shape (batches, episode_timesteps)
     def compute(self, reward_batch: list[list[float]]) -> list[list[float]]:
         batch = []
 
@@ -332,7 +341,7 @@ class PPO_Agent():
             for reward in ep_reward[::-1]:
                 discounted_reward = reward + discounted_reward * self.discount_factor
                 batch.insert(0, discounted_reward)
-        batch = torch.tensor(batch, torch.float)
+        batch = torch.tensor(batch, dtype=torch.float, device=DEVICE)
 
         return batch
 
@@ -348,6 +357,8 @@ class PPO_Agent():
 
         return action.item(), log_prob.detach()
 
+
 if __name__ == "__main__":
     agent = DQN_Agent("4_way")
     agent2 = PPO_Agent("4_way")
+    agent2.run()

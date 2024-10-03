@@ -9,6 +9,7 @@ DQN:
     batch_size: 64  # size of batch of replayed memories
     max_len: 99999999  # max lenght of replay memories
     sync_steps: 1000  # number of steps until weights of policy network are copied to the target network
+    episode_time: 10 # in seconds
 
 PPO:
   4_way:
@@ -16,3 +17,4 @@ PPO:
     batches: 64
     discount_factor: 0.95
     model_version: ppo_1
+    episode_time: 10 # in seconds
