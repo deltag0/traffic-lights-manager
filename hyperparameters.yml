@@ -13,8 +13,11 @@ DQN:
 
 PPO:
   4_way:
+    lr: 0.001
     clip: 0.2
-    batches: 64
     discount_factor: 0.95
     model_version: ppo_1
-    episode_time: 10 # in seconds
+    max_steps: 4  # number of steps before updating network (regular basis)
+    overload: 4  # number of lanes to be filled for this to be considered a fail state
+    batches: 2
+    iteration_updates: 5  # number of time we perform on our actor
