@@ -19,15 +19,6 @@ from typing import Type
 from itertools import count  # used for infinite loop
 
 
-from constants import DEVICE, DATE_FORMAT, DIR_PATH, PHASE_TIME
-sys.path.insert(0, os.path.join(DIR_PATH, "models", "DQN"))  # allow imports from DQN
-sys.path.insert(0, os.path.join(DIR_PATH, "models", "PPO"))  # allow imports from PPO
-from dqn import DQN
-from ppo import PPO
-from experience import Saved_Memories
-from envs import Four_way
-
-
 class DQN_Agent():
     """
     Class for the DQN agent. There are 2 modes, training mode and evaluating mode.
