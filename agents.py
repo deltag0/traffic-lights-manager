@@ -4,6 +4,7 @@ import random
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
+from collections import namedtuple
 
 
 import torch.optim
