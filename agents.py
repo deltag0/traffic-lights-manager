@@ -20,15 +20,6 @@ from typing import Type
 from itertools import count  # used for infinite loop
 
 
-from constants import DEVICE, DATE_FORMAT, DIR_PATH, PHASE_TIME
-sys.path.insert(0, os.path.join(DIR_PATH, "models", "DQN"))  # allow imports from DQN
-sys.path.insert(0, os.path.join(DIR_PATH, "models", "PPO"))  # allow imports from PPO
-from dqn import DQN
-from ppo import PPO
-from experience import Saved_Memories
-from envs import Four_way
-
-
 class DQN_Agent():
     """
     Class for the DQN agent. There are 2 modes, training mode and evaluating mode.
@@ -236,11 +227,16 @@ class PPO_Agent():
         self.clip = hyperparameters["clip"]
         self.discount_factor = hyperparameters["discount_factor"]
         self.model_version = hyperparameters["model_version"]
-        self.max_steps = hyperparameters["max_steps"]
+        self.update_steps = hyperparameters["update_steps"]
         self.overload = hyperparameters["overload"]
         self.batches = hyperparameters["batches"]
         self.iteration_updates = hyperparameters["iteration_updates"]
         self.lr = hyperparameters["lr"]
+        self.beta = hyperparameters["beta"]
+        self.overload_penalty = hyperparameters["overload_penalty"]
+        self.max_steps = hyperparameters["max_steps"]
+        self.max_grad_norm = hyperparameters["max_grad_norm"]
+        self.lam = hyperparameters["lambda"]
 
         # initialize path files
         self.log_file = os.path.join(DIR_PATH, "models", self.model, "logs", self.model_version + ".txt")
@@ -266,8 +262,21 @@ class PPO_Agent():
 
         update_num = 0
 
-        state = env.reset()[0]
-        input_layers = len(state)
+        state_dict = env.reset()
+
+        # num_intersections is the number of intersection PER meeting point
+        num_intersections = len(state_dict.keys())
+
+        if num_intersections == 1:
+            action_dict = {'t': 0}
+            key = 't'
+        else:
+            action_dict = {}
+            for i in range(num_intersections):
+                action_dict[str(i)] = 0
+                key = 0
+
+        input_layers = len(state_dict[str(key)])
         output_layers = env.action_space.n
 
         self.cov_var = torch.full(size=(output_layers, ), fill_value=0.5)
@@ -276,7 +285,7 @@ class PPO_Agent():
 
         # initialize the critic network
         if is_training:
-            self.batch_size = self.max_steps // self.batches
+            self.batch_size = self.update_steps // self.batches
 
             critic = PPO(input_layers, 1, intersection.lanes, intersection.max_occupancy)
             critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.lr)
@@ -284,115 +293,177 @@ class PPO_Agent():
 
             loss_history = []
             steps = 0
+            accumulated_steps = 0
+            simulation_steps = 0  # used for choosing a new action every 10 steps
 
+            # initialize data for collecting information from steps
             mean_waiting_time = []
             accumulated_rewards = []
+            rewards_buffer = []
+            state_buffer = []
+            action_buffer = []
+            prob_buffer = []
+            value_buffer = []
 
         # main loop
         for i in count(0):
-            state = env.reset()[0]
-            state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
-
-            # initialize data for collecting information from steps
-            if is_training:
-                rewards_buffer = []
-                state_buffer = []
-                action_buffer = []
-                prob_buffer = []
-                steps = 0
+            state_dict = env.reset()
+            state = self.dict_to_tensor(state_dict)
+            curr_action = self.dict_to_tensor(action_dict)
 
             terminated = False
 
-            rewards_accumulated = 0.0
+            if is_training:
+                rewards_accumulated = 0.0
+                accumulated_steps = 0
 
-            curr_action = 0
+            self.start = False
+
             info = defaultdict(lambda: -1)
 
             # continuing task loop
             while not terminated:
-                print(state[1])
-                if int(info["step"]) % 10 == 0:
-                    curr_action, log_prob = self.get_action(state.unsqueeze(0))
+                if simulation_steps % 10 == 0:
+                    action_dict, log_prob = self.get_action(state.unsqueeze(0), num_intersections)
+                    curr_action = self.dict_to_tensor(action_dict)
                     self.start = True
 
-                new_state, reward, terminated, _, info = env.step(curr_action)
+                if is_training:
+                    val = critic(state.unsqueeze(0))
 
-                rewards_accumulated += reward
+                new_state_dict, reward, terminated, info = env.step(action_dict)
+                terminated = terminated["__all__"]
+
+                simulation_steps += 5
 
                 # track data
                 if is_training and self.start:
-                    rewards_buffer.append(reward)
+                    rewards_accumulated += self.calculate_rewards(reward)
+
+                    rewards_buffer.append(self.dict_to_tensor(reward))
                     state_buffer.append(state)
                     action_buffer.append(curr_action)
                     prob_buffer.append(log_prob)
+                    value_buffer.append(val.flatten()) # MIGHT need to change this
                     mean_waiting_time.append(info["system_mean_waiting_time"])
+
                     steps += 1
+                    accumulated_steps += 1
 
-                if self.lane_overload(new_state):
-                    break
+                state = self.dict_to_tensor(new_state_dict)
 
-                state = new_state
-                state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
+                # check for extremely poor model performance
+                # if self.lane_overload(state):
+                #     # rewards_buffer[-1] -= self.overload_penalty
+                #     break
 
                 # trigger update
-                if steps == self.max_steps and self.start:
+                if steps == self.update_steps and self.start:
                     steps = 0
 
                     update_num += 1
 
                     # batchify data
                     state_buffer = torch.stack(state_buffer)
-                    action_buffer = torch.tensor(action_buffer, dtype=torch.float32, device=DEVICE)
+                    state_buffer = state_buffer.view(self.batches,
+                                                     self.batch_size * num_intersections,
+                                                     input_layers)
+
+                    action_buffer = torch.stack(action_buffer)
+                    action_buffer = action_buffer.view(self.batches,
+                                                       self.batch_size * num_intersections,
+                                                       1)
+
                     prob_buffer = torch.tensor(prob_buffer, dtype=torch.float32, device=DEVICE)
-
-                    # Advantage function
-                    V, _ = self.evaluate(state_buffer, critic, action_buffer)
-
-                    # compute discounted rewards
                     rewards_buffer = self.batchify(rewards_buffer)
-                    rewards_buffer = self.compute(rewards_buffer)
+                    # rewards_buffer = self.compute(rewards_buffer)
+                    value_buffer = self.batchify(value_buffer)
 
-                    advantage = rewards_buffer - V.detach()
+                    # V, _, _ = self.evaluate(state_buffer, critic, action_buffer)
+
+                    # A_k = rewards_buffer - V.detach()
+
+                    # compute advantages
+                    A_k = self.compute_gae(rewards_buffer, value_buffer)
 
                     # normalize advantage
-                    advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-10)
+                    A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+
+                    # # calculate advantage function
+                    V = critic(state_buffer).flatten()
+
+                    rewards_buffer = A_k + V.detach()
 
                     # update policy and critic
                     for _ in range(self.iteration_updates):
-                        V, curr_log_prob = self.evaluate(state_buffer, critic, action_buffer)
+                        frac = accumulated_steps / self.max_steps
+                        # self.lr = max(self.lr * (1.0 - frac), 0.0)  # learning rate decay, formula can be adjusted
+                        # optimizer.param_groups[0]["lr"] = self.lr
+                        # critic_optimizer.param_groups[0]["lr"] = self.lr
 
-                        ratios = torch.exp(curr_log_prob - prob_buffer)
+                        V, entropy_bonus, curr_log_prob = self.evaluate(state_buffer, critic, action_buffer.squeeze(-1))
 
-                        surr1 = ratios * advantage
-                        surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * advantage
+                        log_ratio = curr_log_prob.flatten() - prob_buffer
+                        ratios = torch.exp(log_ratio)
+
+                        surr1 = ratios * A_k
+                        surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
 
                         policy_loss = (-torch.min(surr1, surr2)).mean()
+
+                        total_loss = policy_loss - entropy_bonus
+
                         self.policy.zero_grad()
-                        policy_loss.backward(retain_graph=True)
+                        total_loss.backward(retain_graph=True)
+                        # nn.utils.clip_grad_norm(self.policy.parameters(), self.max_grad_norm)
                         optimizer.step()
                         loss_history.append(policy_loss.item())
 
                         critic_loss = self.loss_fn(V, rewards_buffer)
                         critic.zero_grad()  # critic estimates average reward we get in a state
                         critic_loss.backward()
+                        nn.utils.clip_grad_norm(critic.parameters(), self.max_grad_norm)
                         critic_optimizer.step()
 
                     rewards_buffer = []
                     state_buffer = []
                     action_buffer = []
                     prob_buffer = []
+                    value_buffer = []
+                    if is_training:
+                        print(f"At update {update_num}, Accumulated reward of: {rewards_accumulated:0.2f} \n ---- Policy loss of {policy_loss:0.2f}")
 
-                    print(f"At update {update_num}, Accumulated reward of: {rewards_accumulated:0.2f} \n ---- Policy loss of {policy_loss:0.2f}")
+                        if datetime.now() - last_update > timedelta(seconds=10) and update_num > 10:
+                            last_update = datetime.now()
+                            self.save_graph(accumulated_rewards, loss_history)
+                            self.save_times(mean_waiting_time)
 
-                    accumulated_rewards.append(rewards_accumulated)
+                        accumulated_rewards.append(rewards_accumulated)
+                        rewards_accumulated = 0.0
 
-                    if datetime.now() - last_update > timedelta(seconds=10) and update_num > 10:
-                        last_update = datetime.now()
-                        self.save_graph(accumulated_rewards, loss_history)
-                        self.save_times(mean_waiting_time)
+    def calculate_rewards(self, rew_dict: dict[str: torch.Tensor]) -> float:
+        total = 0
 
-                    accumulated_rewards.append(rewards_accumulated)
-                    rewards_accumulated = 0.0
+        for reward in list(rew_dict.values()):
+            total += reward
+
+        return total
+
+    # 
+    def dict_to_tensor(self, val_dict: dict[str: int]) -> torch.Tensor:
+        """
+        val_dict: dictionary with keys and values for the state of each intersection
+
+        returns a tensor of size (number_of_intersections, observation_space)
+        """
+        state = []
+
+        for intersection_state in list(val_dict.values()):
+            state.append(intersection_state)
+
+        state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
+
+        return state
 
     def save_times(self, waiting_time: list[float]) -> None:
         fig = plt.figure(1)
@@ -412,7 +483,6 @@ class PPO_Agent():
         for x in range(len(mean_rewards)):
             mean_rewards[x] = np.mean(rewards_per_episode[max(0, x-99):(x+1)])
 
-        print(mean_rewards)
         plt.subplot(121)
         plt.ylabel('Mean Rewards')
         plt.plot(mean_rewards)
@@ -450,17 +520,19 @@ class PPO_Agent():
 
     # evaluates the states according to the critic network
     def evaluate(self, state_batch: torch.Tensor, critic: torch.nn.Module, action_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
-        V = critic(state_batch).squeeze()
+        V = critic(state_batch)
         logits = self.policy(state_batch)
 
         dist = Categorical(logits=logits)
+        entropy = dist.entropy().mean()
+        entropy_bonus = self.beta * entropy
+
         log_probs = dist.log_prob(action_batch)
 
-        return V, log_probs
+        return V, entropy_bonus, log_probs
 
     # returns a list of shape (episode_timesteps)
-    def compute(self, reward_batch: list[list[torch.Tensor]]) -> list[torch.Tensor]:
+    def compute(self, reward_batch: list[list[float]]) -> list[torch.Tensor]:
         batch = []
 
         for ep_reward in reward_batch[::-1]:
@@ -475,9 +547,61 @@ class PPO_Agent():
 
         return batch
 
-    def get_action(self, state: torch.Tensor) -> tuple[int, float]:
+    def compute_gae(self, reward_batch: list[list[float]], value_batch: list[list[float]]) -> list[torch.Tensor]:
         """
-        get action from policy in state state TO DO
+        reward_batch: list of rewards for the data collected within update_steps.
+                      Has dimension (batches, update_steps / batches)
+        value_batch: list of values (expected reward) for the data collected within update_steps.
+                      Has dimension (batches, update_steps / batches)
+
+        returns a list of tensors of shape (update_steps) with the advantages
+        """
+        batch_advantages = []
+        for seq_rewards, seq_vals in zip(reward_batch, value_batch):
+            advantages = []
+            last_advantage = 0
+
+            seq_len = len(seq_rewards)
+            # compute advantages for every batch
+            for i in reversed(range(seq_len)):
+                if i + 1 < seq_len:
+                    delta = seq_rewards[i] + self.discount_factor * seq_vals[i + 1] - seq_vals[i]
+                else:
+                    delta = seq_rewards[i] - seq_vals[i]
+
+                advantage = delta + self.discount_factor * self.lam * last_advantage
+                last_advantage = advantage
+                advantages.insert(0, advantage)  # reorder advantages in batch in original order
+
+            batch_advantages.extend(advantages)  # flattened and transformed reward_batch into advantages
+
+        batch_advantages = torch.tensor(batch_advantages, dtype=torch.float, device=DEVICE)
+
+        return batch_advantages
+
+    def create_action_dict(self, size: int, items: torch.Tensor) -> dict[str: int]:
+        """
+        size: number of intersections of the current environemnt as an integer
+        items: tensor of shape (number_of_intersections, 1) for the actions of each intersection
+
+        returns a dictionary format of the actions
+        """
+        if size == 1:
+            return {'t': items.item()}
+        else:
+            d = {}
+
+            for i in range(size):
+                d[str(i)] = items[i].item()
+
+            return d
+
+    def get_action(self, state: torch.Tensor, num_intersections: int) -> tuple[dict[str: int], float]:
+        """
+        state: tensor of shape (number_of_intersections, observation_space)
+        num_intersections: number_of_intersections as an integer
+
+        returns the actions for the current state as a dictionary and the log probability of taking that action as a float
         """
 
         logits = self.policy(state)
@@ -485,7 +609,7 @@ class PPO_Agent():
         action = dist.sample()
         log_prob = dist.log_prob(action)
 
-        return action.item(), log_prob.detach()
+        return self.create_action_dict(num_intersections, action), log_prob.detach()
 
 
 if __name__ == "__main__":
