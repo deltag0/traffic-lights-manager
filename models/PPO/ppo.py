@@ -18,11 +18,6 @@ class PPO(nn.Module):
         self.layer3 = nn.Linear(hidden_layer, output_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # total intersections
-        batches, num_intersections_in_batch, obs_space = x.shape
-
-        # flatten x
-        x = x.view(batches * num_intersections_in_batch, obs_space)
 
         # return a tensor of shape (batch_size, num_intersections, output_layers)
-        return self.layer3(F.relu(self.layer2(F.relu(self.layer1(x))))).view(batches, num_intersections_in_batch, -1)
+        return self.layer3(F.relu(self.layer2(F.relu(self.layer1(x)))))
