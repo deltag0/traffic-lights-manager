@@ -48,4 +48,3 @@ class FourxFour:
     )
     lanes = 16
     max_occupancy = 10
-    
