@@ -256,7 +256,7 @@ class PPO_Agent():
             with open(self.log_file, 'w') as f:
                 f.write(log_message + '\n')
 
-        intersection = Four_way(True)
+        intersection = FourxFour(display=True)
 
         env = intersection.env
 
@@ -278,8 +278,6 @@ class PPO_Agent():
 
         input_layers = len(state_dict[str(key)])
         output_layers = env.action_space.n
-
-        self.cov_var = torch.full(size=(output_layers, ), fill_value=0.5)
 
         self.policy = PPO(input_layers, output_layers, intersection.lanes, intersection.max_occupancy)
 
@@ -308,7 +306,11 @@ class PPO_Agent():
         # main loop
         for i in count(0):
             state_dict = env.reset()
+
+            # state has a shape of (num_intersections, obs_space)
             state = self.dict_to_tensor(state_dict)
+
+            # action has shape (num_intersections,)
             curr_action = self.dict_to_tensor(action_dict)
 
             terminated = False
@@ -329,7 +331,7 @@ class PPO_Agent():
                     self.start = True
 
                 if is_training:
-                    val = critic(state.unsqueeze(0))
+                    val = critic(state.unsqueeze(0)).squeeze()
 
                 new_state_dict, reward, terminated, info = env.step(action_dict)
                 terminated = terminated["__all__"]
@@ -340,12 +342,14 @@ class PPO_Agent():
                 if is_training and self.start:
                     rewards_accumulated += self.calculate_rewards(reward)
 
+                    # reward, log_prob, val have shape (num_intersections, )
                     rewards_buffer.append(self.dict_to_tensor(reward))
+                    prob_buffer.append(log_prob)
+                    value_buffer.append(val.flatten().detach())  # MIGHT need to change this
+
                     state_buffer.append(state)
                     action_buffer.append(curr_action)
-                    prob_buffer.append(log_prob)
-                    value_buffer.append(val.flatten()) # MIGHT need to change this
-                    mean_waiting_time.append(info["system_mean_waiting_time"])
+                    mean_waiting_time.append(info['system_mean_waiting_time'])
 
                     steps += 1
                     accumulated_steps += 1
@@ -353,9 +357,9 @@ class PPO_Agent():
                 state = self.dict_to_tensor(new_state_dict)
 
                 # check for extremely poor model performance
-                # if self.lane_overload(state):
-                #     # rewards_buffer[-1] -= self.overload_penalty
-                #     break
+                if self.lane_overload(state, output_layers):
+                    # rewards_buffer[-1] -= self.overload_penalty
+                    break
 
                 # trigger update
                 if steps == self.update_steps and self.start:
@@ -364,35 +368,39 @@ class PPO_Agent():
                     update_num += 1
 
                     # batchify data
+
+                    # state_buffer has shape (num_batches, batch_size, num_intersections, obs_space)
                     state_buffer = torch.stack(state_buffer)
                     state_buffer = state_buffer.view(self.batches,
-                                                     self.batch_size * num_intersections,
+                                                     self.batch_size,
+                                                     num_intersections,
                                                      input_layers)
 
+                    # action_buffer, prob_buffer have shape (num_batches * batch_size, num_intersections)
                     action_buffer = torch.stack(action_buffer)
-                    action_buffer = action_buffer.view(self.batches,
-                                                       self.batch_size * num_intersections,
-                                                       1)
+                    prob_buffer = torch.stack(prob_buffer)
 
-                    prob_buffer = torch.tensor(prob_buffer, dtype=torch.float32, device=DEVICE)
+                    # rewards_buffer, value_buffer are lists of "shape" (num_batches, batch_size, num_intersections)
                     rewards_buffer = self.batchify(rewards_buffer)
-                    # rewards_buffer = self.compute(rewards_buffer)
                     value_buffer = self.batchify(value_buffer)
 
-                    # V, _, _ = self.evaluate(state_buffer, critic, action_buffer)
-
-                    # A_k = rewards_buffer - V.detach()
-
                     # compute advantages
+
+                    # A_k has shape (num_batches * batch_size, num_intersections)
                     A_k = self.compute_gae(rewards_buffer, value_buffer)
 
                     # normalize advantage
                     A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
-                    # # calculate advantage function
-                    V = critic(state_buffer).flatten()
+                    V = []
 
-                    rewards_buffer = A_k + V.detach()
+                    # calculate advantage function batches
+                    for state_batch in state_buffer:
+                        V.append(critic(state_batch))
+
+                    V = torch.cat(V, dim=0).squeeze()
+
+                    discounted_rewards = A_k + V.detach()
 
                     # update policy and critic
                     for _ in range(self.iteration_updates):
@@ -401,9 +409,9 @@ class PPO_Agent():
                         # optimizer.param_groups[0]["lr"] = self.lr
                         # critic_optimizer.param_groups[0]["lr"] = self.lr
 
-                        V, entropy_bonus, curr_log_prob = self.evaluate(state_buffer, critic, action_buffer.squeeze(-1))
+                        V, entropy_bonus, curr_log_prob = self.evaluate(state_buffer, critic, action_buffer)
 
-                        log_ratio = curr_log_prob.flatten() - prob_buffer
+                        log_ratio = curr_log_prob - prob_buffer
                         ratios = torch.exp(log_ratio)
 
                         surr1 = ratios * A_k
@@ -419,7 +427,7 @@ class PPO_Agent():
                         optimizer.step()
                         loss_history.append(policy_loss.item())
 
-                        critic_loss = self.loss_fn(V, rewards_buffer)
+                        critic_loss = self.loss_fn(V, discounted_rewards)
                         critic.zero_grad()  # critic estimates average reward we get in a state
                         critic_loss.backward()
                         nn.utils.clip_grad_norm(critic.parameters(), self.max_grad_norm)
@@ -442,6 +450,12 @@ class PPO_Agent():
                         rewards_accumulated = 0.0
 
     def calculate_rewards(self, rew_dict: dict[str: torch.Tensor]) -> float:
+        """
+        rew_dict: dictionary with intersecionts indexed from 0 to num_intersections having values of the rewards received
+        for the current state
+
+        returns: the total reward of the environment
+        """
         total = 0
 
         for reward in list(rew_dict.values()):
@@ -449,23 +463,29 @@ class PPO_Agent():
 
         return total
 
-    # 
     def dict_to_tensor(self, val_dict: dict[str: int]) -> torch.Tensor:
         """
         val_dict: dictionary with keys and values for the state of each intersection
 
-        returns a tensor of size (number_of_intersections, observation_space)
+        returns: a tensor of size (number_of_intersections, observation_space)
         """
-        state = []
+        vals = []
 
-        for intersection_state in list(val_dict.values()):
-            state.append(intersection_state)
+        for val in list(val_dict.values()):
+            vals.append(val)
 
-        state = torch.tensor(state, dtype=torch.float32, device=DEVICE)
+        state = torch.tensor(np.array(vals), dtype=torch.float32, device=DEVICE)
 
         return state
 
     def save_times(self, waiting_time: list[float]) -> None:
+        """
+        waiting_time: list of average waiting time of the environment after each timestep
+            Shape of (num_timesteps)
+
+        effects: saves graph of average waiting time to steps
+        """
+
         fig = plt.figure(1)
         waiting_time = np.array(waiting_time)
         plt.ylabel('Mean Waiting Time')
@@ -476,12 +496,20 @@ class PPO_Agent():
         fig.savefig(self.waiting_file)
         plt.close(fig)
 
-    def save_graph(self, rewards_per_episode: list[float], loss: list[float]) -> None:
+    def save_graph(self, rewards_per_step: list[float], loss: list[float]) -> None:
+        """
+        rewards_per_episode: list with rewards per time step of model
+            Shape of (num_timesteps)
+        loss: list with losses of model per time step
+            Shape of (num_timesteps)
+
+        effects: saves an image with 2 graphs
+        """
         fig = plt.figure(1)
 
-        mean_rewards = np.zeros(len(rewards_per_episode))
+        mean_rewards = np.zeros(len(rewards_per_step))
         for x in range(len(mean_rewards)):
-            mean_rewards[x] = np.mean(rewards_per_episode[max(0, x-99):(x+1)])
+            mean_rewards[x] = np.mean(rewards_per_step[max(0, x-99):(x+1)])
 
         plt.subplot(121)
         plt.ylabel('Mean Rewards')
@@ -498,19 +526,33 @@ class PPO_Agent():
         fig.savefig(self.graph_file)
         plt.close(fig)
 
-    # returns true if there are too many filled lanes (based off of hyperparameter)
-    def lane_overload(self, state: list[float]):
-        score = 0
-        for i in range(5, 12):
-            score += state[i]
+    def lane_overload(self, state: torch.Tensor, num_actions: int) -> bool:
+        """
+        state: shape of (num_intersections, obs_space)
+        num_actions: number of possible actions of the environment
 
-        if score >= self.overload:
-            return True
-        else:
-            return False
+        returns True for early environment reset, False if model is performing ok
+        """
+
+        score = 0
+        start = num_actions + 1
+        end = (len(state[0]) - start) // 2 + 3
+
+        for intersection in state:
+            # start based on structure of observation space
+            for i in range(start, end):
+                score += intersection[i]
+
+        return score >= self.overload
 
     # turns buffers into batches with the size specified in the hyperparameters
-    def batchify(self, data: list[torch.Tensor]) -> torch.Tensor:
+    def batchify(self, data: list[torch.Tensor]) -> list[list[torch.Tensor]]:
+        """
+        data: list of shape (num_batches * batch_size)
+
+        returns a list of shape (num_batches, batch_size)
+        """
+
         batch = []
 
         for i in range(self.batches):
@@ -519,9 +561,29 @@ class PPO_Agent():
         return batch
 
     # evaluates the states according to the critic network
-    def evaluate(self, state_batch: torch.Tensor, critic: torch.nn.Module, action_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        V = critic(state_batch)
-        logits = self.policy(state_batch)
+    def evaluate(self, state_batch: torch.Tensor, critic: torch.nn.Module, action_batch: torch.Tensor) -> tuple[torch.Tensor, float, torch.Tensor]:
+        """
+        state_batch: tensor of shape (num_batches, batch_size, num_intersections, obs_space)
+        critic: critic network
+        action_batch: tensor of shape (num_batches, batch_size, num_intersections)
+
+        returns: tuple of size 3 containing:
+            V (advantage values): tensor of shape (num_batches * batch_size, num_intersections)
+            entropy_bonus: float
+            log_probs: tensor of shape (num_batches * batch_size, num_intersections)
+
+        """
+
+        V = []
+        logits = []
+
+        # calculate advantage function batches
+        for state in state_batch:
+            V.append(critic(state))
+            logits.append(self.policy(state))
+
+        V = torch.cat(V, dim=0).squeeze()
+        logits = torch.cat(logits, dim=0)
 
         dist = Categorical(logits=logits)
         entropy = dist.entropy().mean()
@@ -532,7 +594,12 @@ class PPO_Agent():
         return V, entropy_bonus, log_probs
 
     # returns a list of shape (episode_timesteps)
-    def compute(self, reward_batch: list[list[float]]) -> list[torch.Tensor]:
+    def compute(self, reward_batch: list[list[float]]) -> torch.Tensor:
+        """
+        reward_batch: list of shape (num_batches, batch_size, num_intersections)
+
+        returns: OUTDATED
+        """
         batch = []
 
         for ep_reward in reward_batch[::-1]:
@@ -550,12 +617,13 @@ class PPO_Agent():
     def compute_gae(self, reward_batch: list[list[float]], value_batch: list[list[float]]) -> list[torch.Tensor]:
         """
         reward_batch: list of rewards for the data collected within update_steps.
-                      Has dimension (batches, update_steps / batches)
+                      List of dimension (num_batches, batch_size, num_intersections)
         value_batch: list of values (expected reward) for the data collected within update_steps.
-                      Has dimension (batches, update_steps / batches)
+                      List of dimension (num_batches, batch_size, num_intersections)
 
-        returns a list of tensors of shape (update_steps) with the advantages
+        returns: list of tensors of shape (update_steps) with the advantages
         """
+
         batch_advantages = []
         for seq_rewards, seq_vals in zip(reward_batch, value_batch):
             advantages = []
@@ -575,7 +643,7 @@ class PPO_Agent():
 
             batch_advantages.extend(advantages)  # flattened and transformed reward_batch into advantages
 
-        batch_advantages = torch.tensor(batch_advantages, dtype=torch.float, device=DEVICE)
+        batch_advantages = torch.stack(batch_advantages)
 
         return batch_advantages
 
@@ -586,13 +654,14 @@ class PPO_Agent():
 
         returns a dictionary format of the actions
         """
+
         if size == 1:
-            return {'t': items.item()}
+            return {'t': items[0]}
         else:
             d = {}
 
             for i in range(size):
-                d[str(i)] = items[i].item()
+                d[str(i)] = items[i]
 
             return d
 
@@ -601,10 +670,10 @@ class PPO_Agent():
         state: tensor of shape (number_of_intersections, observation_space)
         num_intersections: number_of_intersections as an integer
 
-        returns the actions for the current state as a dictionary and the log probability of taking that action as a float
+        returns: actions for the current state as a dictionary and the log probability of taking that action as a float
         """
 
-        logits = self.policy(state)
+        logits = self.policy(state).squeeze(0)
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)

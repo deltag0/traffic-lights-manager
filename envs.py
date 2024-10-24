@@ -30,4 +30,21 @@ class Four_way:
         use_gui=display
     )
     lanes = 4
-    max_occupancy = 19
+    max_occupancy = 30
+
+
+@dataclass
+class FourxFour:
+    """
+    todo
+    """
+
+    display: bool = False
+    env = SumoEnvironment(
+        net_file=os.path.join(DIR_PATH, "sumo_nets", "4x4_Grid", "4x4.net.xml"),
+        route_file=os.path.join(DIR_PATH, "sumo_nets", "4x4_Grid", "4x4.rou.xml"),
+        num_seconds=RUNTIME,
+        use_gui=display
+    )
+    lanes = 16
+    max_occupancy = 10

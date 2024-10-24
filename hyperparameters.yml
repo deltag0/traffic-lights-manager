@@ -26,3 +26,19 @@ PPO:
     overload_penalty: -1
     max_grad_norm: 0.5  # for clipping of grad norm
     lambda: 0.95
+
+  4x4:
+    lr: 0.001
+    clip: 0.2
+    discount_factor: 0.98
+    model_version: ppo_2
+    max_steps: 99999
+    update_steps: 40
+    overload: 64
+    batches: 10
+    iteration_updates: 5
+    beta: 0.05
+    overload_penalty: -1
+    max_grad_norm: 0.5
+    lambda: 0.95
+    
