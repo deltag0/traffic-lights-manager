@@ -4,7 +4,6 @@ import random
 import time
 from datetime import datetime, timedelta
 from collections import defaultdict
-from collections import namedtuple
 
 
 import torch.optim
@@ -18,6 +17,15 @@ from torch.utils.tensorboard import SummaryWriter  # using tensorboard for easie
 from matplotlib import pyplot as plt
 from typing import Type
 from itertools import count  # used for infinite loop
+
+
+from constants import DEVICE, DATE_FORMAT, DIR_PATH, EVAL_STEPS
+sys.path.insert(0, os.path.join(DIR_PATH, "models", "DQN"))  # allow imports from DQN
+sys.path.insert(0, os.path.join(DIR_PATH, "models", "PPO"))  # allow imports from PPO
+from dqn import DQN
+from ppo import PPO
+from experience import Saved_Memories
+from envs import Four_way, FourxFour, TwoxTwo
 
 
 class DQN_Agent():
@@ -212,6 +220,18 @@ class DQN_Agent():
 
 
 class PPO_Agent():
+    """
+    PPO model has 2 training modes, training mode and evaluating mode
+
+    initializing arguments:
+
+    intersection_type: str that can either be 4_way, FourxFour, TwoxTwo (for now)
+
+    training mode updates the weights of the model using the the default algorithms in PPO,
+    adapted for the continuing task nature of the task
+
+    evaluating mode can be used to compare results between the trained model and the standard_cycle agent
+    """
     def __init__(self, intersection_type: str):
         self.model = "PPO"
         self.writer = SummaryWriter()
@@ -221,6 +241,7 @@ class PPO_Agent():
         # getting hyperparameters from .yml as a dictionary
         with open("hyperparameters.yml", 'r') as f:
             hyperparameters = yaml.safe_load(f)
+            self.save_steps = hyperparameters[self.model]["save_steps"]
             hyperparameters = hyperparameters[self.model][intersection_type]
 
         # initializing hyperparameters
@@ -244,7 +265,10 @@ class PPO_Agent():
         self.model_file = os.path.join(DIR_PATH, "models", self.model, "trained_models", self.model_version + ".pth")
         self.waiting_file = os.path.join(DIR_PATH, "models", self.model, "graphs", self.model_version + "_waiting.png")
 
-    def run(self, is_training: bool = True) -> None:
+    def run(self, is_training: bool = True) -> list[float] | None:
+        """
+        main function to run the PPO for testing/training
+        """
 
         # log messages of training
         if is_training:
@@ -256,30 +280,29 @@ class PPO_Agent():
             with open(self.log_file, 'w') as f:
                 f.write(log_message + '\n')
 
-        intersection = FourxFour(display=True)
+        intersection = TwoxTwo(display=False)
 
         env = intersection.env
 
         update_num = 0
 
         state_dict = env.reset()
+        self.keys = list(state_dict.keys())
 
         # num_intersections is the number of intersection PER meeting point
-        num_intersections = len(state_dict.keys())
+        num_intersections = len(self.keys)
+        action_dict = {}
 
-        if num_intersections == 1:
-            action_dict = {'t': 0}
-            key = 't'
-        else:
-            action_dict = {}
-            for i in range(num_intersections):
-                action_dict[str(i)] = 0
-                key = 0
+        for key in self.keys:
+            action_dict[key] = 0
 
         input_layers = len(state_dict[str(key)])
         output_layers = env.action_space.n
 
         self.policy = PPO(input_layers, output_layers, intersection.lanes, intersection.max_occupancy)
+
+        if not is_training:
+            self.policy = torch.load_state_dict(torch.load(self.model_file))
 
         # initialize the critic network
         if is_training:
@@ -325,6 +348,9 @@ class PPO_Agent():
 
             # continuing task loop
             while not terminated:
+                if is_training and steps == EVAL_STEPS:
+                    return mean_waiting_time
+
                 if simulation_steps % 10 == 0:
                     action_dict, log_prob = self.get_action(state.unsqueeze(0), num_intersections)
                     curr_action = self.dict_to_tensor(action_dict)
@@ -333,36 +359,37 @@ class PPO_Agent():
                 if is_training:
                     val = critic(state.unsqueeze(0)).squeeze()
 
-                new_state_dict, reward, terminated, info = env.step(action_dict)
+                new_state_dict, reward_dict, terminated, info = env.step(action_dict)
                 terminated = terminated["__all__"]
 
                 simulation_steps += 5
 
                 # track data
                 if is_training and self.start:
-                    rewards_accumulated += self.calculate_rewards(reward)
+                    rewards_accumulated += self.calculate_rewards(reward_dict)
 
                     # reward, log_prob, val have shape (num_intersections, )
-                    rewards_buffer.append(self.dict_to_tensor(reward))
+                    rewards_buffer.append(self.dict_to_tensor(reward_dict))
                     prob_buffer.append(log_prob)
-                    value_buffer.append(val.flatten().detach())  # MIGHT need to change this
+                    value_buffer.append(val.flatten().detach())
 
                     state_buffer.append(state)
                     action_buffer.append(curr_action)
                     mean_waiting_time.append(info['system_mean_waiting_time'])
 
-                    steps += 1
                     accumulated_steps += 1
+
+                steps += 1
 
                 state = self.dict_to_tensor(new_state_dict)
 
                 # check for extremely poor model performance
-                if self.lane_overload(state, output_layers):
-                    # rewards_buffer[-1] -= self.overload_penalty
-                    break
+                # if self.lane_overload(state, output_layers):
+                #     # rewards_buffer[-1] -= self.overload_penalty
+                #     break
 
                 # trigger update
-                if steps == self.update_steps and self.start:
+                if steps == self.update_steps and self.start and is_training:
                     steps = 0
 
                     update_num += 1
@@ -439,7 +466,11 @@ class PPO_Agent():
                     prob_buffer = []
                     value_buffer = []
                     if is_training:
-                        print(f"At update {update_num}, Accumulated reward of: {rewards_accumulated:0.2f} \n ---- Policy loss of {policy_loss:0.2f}")
+                        log_message = f" At update {update_num} \n ---- Accumulated reward of: {rewards_accumulated:0.2f} \n ---- Policy loss of: {policy_loss:0.2f} \n ---- Mean waiting time of: {mean_waiting_time[-1]}"
+                        print(log_message)
+
+                        with open(self.log_file, 'a') as f:
+                            f.write(log_message + '\n')
 
                         if datetime.now() - last_update > timedelta(seconds=10) and update_num > 10:
                             last_update = datetime.now()
@@ -448,6 +479,12 @@ class PPO_Agent():
 
                         accumulated_rewards.append(rewards_accumulated)
                         rewards_accumulated = 0.0
+
+                    if update_num % self.update_steps == 0 and update_num > 0:
+                        torch.save(self.policy.state_dict(), self.model_file)
+
+        if not is_training:
+            return mean_waiting_time
 
     def calculate_rewards(self, rew_dict: dict[str: torch.Tensor]) -> float:
         """
@@ -593,7 +630,6 @@ class PPO_Agent():
 
         return V, entropy_bonus, log_probs
 
-    # returns a list of shape (episode_timesteps)
     def compute(self, reward_batch: list[list[float]]) -> torch.Tensor:
         """
         reward_batch: list of shape (num_batches, batch_size, num_intersections)
@@ -655,15 +691,14 @@ class PPO_Agent():
         returns a dictionary format of the actions
         """
 
-        if size == 1:
-            return {'t': items[0]}
-        else:
-            d = {}
+        d = {}
+        i = 0
 
-            for i in range(size):
-                d[str(i)] = items[i]
+        for key in self.keys:
+            d[key] = items[i]
+            i += 1
 
-            return d
+        return d
 
     def get_action(self, state: torch.Tensor, num_intersections: int) -> tuple[dict[str: int], float]:
         """
@@ -681,7 +716,116 @@ class PPO_Agent():
         return self.create_action_dict(num_intersections, action), log_prob.detach()
 
 
+class Standard_Cycle():
+    """
+    Standard_cycle is meant to replicate real life behavior of traffic lights, changing the traffic signal
+    after certain intervals
+    """
+
+    def __init__(self, intersection_type: str):
+
+        # getting parameters from .yml as a dictionary
+        with open("hyperparameters.yml", 'r') as f:
+            parameters = yaml.safe_load(f)
+            parameters = parameters["Regular"][intersection_type]
+
+        # setting up cycle parameters
+        self.test_version = parameters["test_version"]
+        self.max_steps = parameters["max_steps"]
+
+        self.waiting_file = os.path.join(DIR_PATH, "models", "CYCLE", "graphs", self.test_version + "_waiting.png")
+
+    def run(self) -> list[float]:
+        """
+        main function to run the standard cycle for the environment
+        """
+        last_update = datetime.now()
+
+        intersection = TwoxTwo()
+
+        env = intersection.env
+
+        simulation_steps = 0
+        update_num = 0
+
+        state_dict = env.reset()
+        self.keys = list(state_dict.keys())
+
+        num_actions = env.action_space.n
+        curr_action = {}
+        action_idx = 0
+
+        for key in self.keys:
+            curr_action[key] = 0
+
+        average_waiting_times = []
+
+        for i in count(0):
+            if update_num == EVAL_STEPS:
+                return average_waiting_times
+
+            if simulation_steps % 10 == 0:
+                curr_action, action_idx = self.find_next_action(action_idx, num_actions)
+
+            simulation_steps += 5
+
+            _, _, _, info = env.step(curr_action)
+            average_waiting_times.append(info["system_mean_waiting_time"])
+
+            update_num += 1
+
+            if update_num % 20 == 0:
+                print(average_waiting_times[-1])
+
+            if datetime.now() - last_update > timedelta(seconds=10) and update_num > 10:
+                last_update = datetime.now()
+                self.save_times(average_waiting_times)
+
+        return average_waiting_times
+
+    def find_next_action(self, curr: int, actions: int) -> tuple[dict[str: int], int]:
+        """
+        curr: the current action as an integer representing the index of the action space
+        actions: number of actions in the action space, used to limit the index of the new action
+
+        returns: new action dictionary
+        """
+
+        d = {}
+
+        if curr + 1 == actions:
+            action_idx = 0
+            for key in self.keys:
+                d[key] = action_idx
+        else:
+            action_idx = curr + 1
+            for key in self.keys:
+                d[key] = action_idx
+
+        return d, action_idx
+
+    def save_times(self, waiting_time: list[float]) -> None:
+        """
+        waiting_time: list of average waiting time of the environment after each timestep
+            Shape of (num_timesteps)
+
+        effects: saves graph of average waiting time to steps
+        """
+
+        fig = plt.figure(1)
+        waiting_time = np.array(waiting_time)
+        plt.ylabel('Mean Waiting Time')
+        plt.plot(waiting_time)
+
+        plt.subplots_adjust(wspace=1.0, hspace=1.0)
+
+        fig.savefig(self.waiting_file)
+        plt.close(fig)
+
+
 if __name__ == "__main__":
     agent = DQN_Agent("4_way")
-    agent2 = PPO_Agent("4_way")
+    agent2 = PPO_Agent("4x4")
+    standard = Standard_Cycle("4_way")
     agent2.run()
+    
