@@ -12,6 +12,9 @@ DQN:
     episode_time: 10 # in seconds
 
 PPO:
+
+  save_steps: 20
+
   4_way:
     lr: 0.0001
     clip: 0.2
@@ -41,4 +44,9 @@ PPO:
     overload_penalty: -1
     max_grad_norm: 0.5
     lambda: 0.95
-    
+
+
+Regular:
+  4_way:
+    max_steps: 99999
+    test_version: test_1
