@@ -285,6 +285,10 @@ class PPO_Agent():
         env = intersection.env
 
         update_num = 0
+        simulation_steps = 0  # used for choosing a new action every 10 steps
+        steps = 0
+
+        mean_waiting_time = []
 
         state_dict = env.reset()
         self.keys = list(state_dict.keys())
@@ -302,7 +306,7 @@ class PPO_Agent():
         self.policy = PPO(input_layers, output_layers, intersection.lanes, intersection.max_occupancy)
 
         if not is_training:
-            self.policy = torch.load_state_dict(torch.load(self.model_file))
+            self.policy.load_state_dict(torch.load(self.model_file))
 
         # initialize the critic network
         if is_training:
@@ -313,12 +317,9 @@ class PPO_Agent():
             optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr)
 
             loss_history = []
-            steps = 0
             accumulated_steps = 0
-            simulation_steps = 0  # used for choosing a new action every 10 steps
 
             # initialize data for collecting information from steps
-            mean_waiting_time = []
             accumulated_rewards = []
             rewards_buffer = []
             state_buffer = []
@@ -348,7 +349,7 @@ class PPO_Agent():
 
             # continuing task loop
             while not terminated:
-                if is_training and steps == EVAL_STEPS:
+                if not is_training and steps == EVAL_STEPS:
                     return mean_waiting_time
 
                 if simulation_steps % 10 == 0:
@@ -375,9 +376,10 @@ class PPO_Agent():
 
                     state_buffer.append(state)
                     action_buffer.append(curr_action)
-                    mean_waiting_time.append(info['system_mean_waiting_time'])
 
                     accumulated_steps += 1
+
+                mean_waiting_time.append(info['system_mean_waiting_time'])
 
                 steps += 1
 
@@ -480,7 +482,7 @@ class PPO_Agent():
                         accumulated_rewards.append(rewards_accumulated)
                         rewards_accumulated = 0.0
 
-                    if update_num % self.update_steps == 0 and update_num > 0:
+                    if update_num % self.save_steps == 0 and update_num > 0:
                         torch.save(self.policy.state_dict(), self.model_file)
 
         if not is_training:
@@ -825,7 +827,6 @@ class Standard_Cycle():
 
 if __name__ == "__main__":
     agent = DQN_Agent("4_way")
-    agent2 = PPO_Agent("4x4")
+    agent2 = PPO_Agent("2x2")
     standard = Standard_Cycle("4_way")
     agent2.run()
-    
