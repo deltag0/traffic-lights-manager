@@ -280,7 +280,7 @@ class PPO_Agent():
             with open(self.log_file, 'w') as f:
                 f.write(log_message + '\n')
 
-        intersection = TwoxTwo(display=False)
+        intersection = FourxFour(display=False)
 
         env = intersection.env
 
@@ -386,9 +386,9 @@ class PPO_Agent():
                 state = self.dict_to_tensor(new_state_dict)
 
                 # check for extremely poor model performance
-                # if self.lane_overload(state, output_layers):
-                #     # rewards_buffer[-1] -= self.overload_penalty
-                #     break
+                if self.lane_overload(state, output_layers):
+                    # rewards_buffer[-1] -= self.overload_penalty
+                    break
 
                 # trigger update
                 if steps == self.update_steps and self.start and is_training:
@@ -743,7 +743,7 @@ class Standard_Cycle():
         """
         last_update = datetime.now()
 
-        intersection = TwoxTwo()
+        intersection = FourxFour(display=True)
 
         env = intersection.env
 
@@ -827,6 +827,6 @@ class Standard_Cycle():
 
 if __name__ == "__main__":
     agent = DQN_Agent("4_way")
-    agent2 = PPO_Agent("2x2")
+    agent2 = PPO_Agent("4x4")
     standard = Standard_Cycle("4_way")
-    agent2.run()
+    standard.run()
