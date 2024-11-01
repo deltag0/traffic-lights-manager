@@ -13,7 +13,7 @@ DQN:
 
 PPO:
 
-  save_steps: 20
+  save_steps: 100
 
   4_way:
     lr: 0.0001
@@ -30,11 +30,11 @@ PPO:
     max_grad_norm: 0.5  # for clipping of grad norm
     lambda: 0.95
 
-  4x4:
+  2x2:
     lr: 0.001
     clip: 0.2
     discount_factor: 0.98
-    model_version: ppo_2
+    model_version: ppo_3
     max_steps: 99999
     update_steps: 40
     overload: 64
@@ -44,6 +44,21 @@ PPO:
     overload_penalty: -1
     max_grad_norm: 0.5
     lambda: 0.95
+
+  4x4:
+    lr: 0.00008
+    clip: 0.12
+    discount_factor: 0.9
+    model_version: ppo_6
+    max_steps: 99999
+    update_steps: 40
+    overload: 64
+    batches: 10
+    iteration_updates: 5
+    beta: 0.01
+    overload_penalty: -1
+    max_grad_norm: 0.5
+    lambda: 0.9
 
 
 Regular:
