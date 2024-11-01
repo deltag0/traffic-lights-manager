@@ -49,7 +49,8 @@ class FourxFour:
             route_file=os.path.join(DIR_PATH, "sumo_nets", "4x4_Grid", "4x4.rou.xml"),
             num_seconds=RUNTIME,
             use_gui=display,
-            sumo_warnings=False
+            sumo_warnings=False,
+            sumo_seed=3
         )
         self.lanes = lanes
         self.max_occupancy = max_occupancy
