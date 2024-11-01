@@ -9,7 +9,7 @@ from constants import DIR_PATH
 model = PPO_Agent("2x2")
 evaluator = Standard_Cycle("4_way")
 
-results_file = os.path.join(DIR_PATH, "results", "comparison.png")
+results_file = os.path.join(DIR_PATH, "results", "comparison_4x4_V4.png")
 
 model_results = model.run(False)
 evaluator_results = evaluator.run()
